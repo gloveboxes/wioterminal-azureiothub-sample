@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include "SCD30.h"
+
 #include "config.h"
 #include "az_iot_helpers.h"
 
@@ -46,27 +48,25 @@ static const az_span model_id = AZ_SPAN_LITERAL_FROM_STR("dtmi:seeed:wioterminal
 
 // Publish 1 message every 2 seconds
 #define TELEMETRY_FREQUENCY_MILLISECS 2000
+#define MQTT_LOOP_FREQUENCE_MILLISECS 1000
 
 static az_iot_hub_client iot_hub_client;
 static bool is_ready_to_send = false;
 static char sas_token[300];
 static unsigned long next_telemetry_send_time_ms = 0;
+static unsigned long next_mqtt_loop_time_ms = 0;
 
 static char telemetry_topic[128];
 
 static const az_span ringBuzzer_command_name_span = AZ_SPAN_LITERAL_FROM_STR("ringBuzzer");
-static char commands_response_topic[128];
-static char commands_response_payload[256];
+// static char commands_response_topic[128];
+// static char commands_response_payload[256];
 
 static const az_span imu_telemetry_name = AZ_SPAN_LITERAL_FROM_STR("imu");
-static char telemetry_payload[80];
+static char telemetry_payload[128];
 
-static void DeviceTwinSetTemperatureHandler(LP_DEVICE_TWIN_BINDING *deviceTwinBinding);
-
-static LP_DEVICE_TWIN_BINDING desiredTemperature;
-static LP_DEVICE_TWIN_BINDING desiredLight;
-static LP_DEVICE_TWIN_BINDING actualTemperature;
-static LP_DEVICE_TWIN_BINDING *deviceTwinBindingSet[] = {&actualTemperature, &desiredTemperature, &desiredLight};
+static LP_DEVICE_TWIN_BINDING desiredCo2AlarmThreshold;
+static LP_DEVICE_TWIN_BINDING *deviceTwinBindingSet[] = {&desiredCo2AlarmThreshold};
 
 static const az_span empty_payload = AZ_SPAN_LITERAL_FROM_STR("{}");
 
@@ -109,134 +109,15 @@ void lcd_log_line(char *line)
     current_text_line %= ((LCD_HEIGHT - 20) / LCD_LINE_HEIGHT);
 }
 
-/// <summary>
-/// Device Twin Handler to set the desired temperature value
-/// </summary>
-static void DeviceTwinSetTemperatureHandler(LP_DEVICE_TWIN_BINDING *deviceTwinBinding)
-{
-    if (deviceTwinBinding->twinType == LP_TYPE_FLOAT)
-    {
-        // desired_temperature = *(float*)deviceTwinBinding->twinState;
-        // SetTemperatureStatusColour(last_temperature);
-        lp_deviceTwinReportState(deviceTwinBinding, deviceTwinBinding->twinState);
-    }
-
-    Serial.println(deviceTwinBinding->twinProperty);
-    Serial.println(*(float *)deviceTwinBinding->twinState);
-
-    lcd_log_line((char *)deviceTwinBinding->twinProperty);
-
-                analogWrite(WIO_BUZZER, 128);
-            delay(*(float *)deviceTwinBinding->twinState);
-            analogWrite(WIO_BUZZER, 0);
-
-    /*	Casting device twin state examples
-
-		float value = *(float*)deviceTwinBinding->twinState;
-		int value = *(int*)deviceTwinBinding->twinState;
-		bool value = *(bool*)deviceTwinBinding->twinState;
-		char* value = (char*)deviceTwinBinding->twinState;
-	*/
-}
-
-// Send the response of the command invocation
-static int send_command_response(
-    az_iot_hub_client_method_request *request,
-    uint16_t status,
-    az_span response)
-{
-    az_result rc;
-    // Get the response topic to publish the command response
-    if (az_failed(
-            rc = az_iot_hub_client_methods_response_get_publish_topic(
-                &iot_hub_client,
-                request->request_id,
-                status,
-                commands_response_topic,
-                sizeof(commands_response_topic),
-                NULL)))
-    {
-        Serial.println("Unable to get method response publish topic");
-        return rc;
-    }
-
-    Serial.printf("Status: %u\tPayload: '", status);
-    char *payload_char = (char *)az_span_ptr(response);
-    if (payload_char != NULL)
-    {
-        for (int32_t i = 0; i < az_span_size(response); i++)
-        {
-            Serial.print(*(payload_char + i));
-        }
-    }
-    Serial.println("'\n");
-
-    // Send the commands response
-    if (mqtt_client.publish(commands_response_topic, az_span_ptr(response), az_span_size(response), false))
-    {
-        Serial.println("Sent response");
-    }
-
-    return rc;
-}
-
-// Invoke the requested command if supported and return status | Return error otherwise
-static void handle_command_message(
-    az_span payload,
-    az_iot_hub_client_method_request *command_request)
-{
-    int command_res_code = 404;
-    char buffer[32];
-
-    az_span_to_str(buffer, 32, payload);
-
-    if (az_span_is_content_equal(ringBuzzer_command_name_span, command_request->name))
-    {
-        // Parse the command payload (it contains a 'duration' field)
-        Serial.println("Processing command 'ringBuzzer'");
-
-        Serial.printf("Raw command payload: %s\r\n", buffer);
-
-        uint32_t duration;
-
-        if (az_span_atou32(payload, &duration) == AZ_OK)
-        {
-            // Invoke command
-            analogWrite(WIO_BUZZER, 128);
-            delay(duration);
-            analogWrite(WIO_BUZZER, 0);
-
-            command_res_code = 200;
-        }
-    }
-
-    if (command_res_code != 200) // Unsupported command
-    {
-        az_span_to_str(buffer, sizeof(buffer), command_request->name);
-        Serial.printf("Unsupported command received: %s.\r\n", buffer);
-    }
-
-    int rc;
-    if ((rc = send_command_response(command_request, command_res_code, empty_payload)) != 0)
-    {
-        printf("Unable to send %d response, status %d\n", command_res_code, rc);
-    }
-}
-
 void callback(char *topic, byte *payload, unsigned int length)
 {
     az_span topic_span = az_span_create((uint8_t *)topic, strlen(topic));
     az_iot_hub_client_method_request command_request;
     az_iot_hub_client_twin_response twin_response;
 
-    lcd_log_line("callback arrived!");
-
     if (az_succeeded(az_iot_hub_client_methods_parse_received_topic(&iot_hub_client, topic_span, &command_request)))
     {
         lcd_log_line("Command arrived!");
-        Serial.println("Command arrived!");
-        // Determine if the command is supported and take appropriate actions
-        handle_command_message(az_span_create(payload, length), &command_request);
     }
     else if (az_iot_hub_client_twin_parse_received_topic(&iot_hub_client, topic_span, &twin_response) == AZ_OK)
     {
@@ -244,6 +125,34 @@ void callback(char *topic, byte *payload, unsigned int length)
     }
 
     Serial.println();
+}
+
+static void get_device_twin_document(const char *twinProperty)
+{
+    // int rc;
+    az_span const twin_document_topic_request_id = az_span_create_from_str((char *)twinProperty);
+
+    if (az_iot_hub_client_twin_document_get_publish_topic(
+            &iot_hub_client,
+            twin_document_topic_request_id,
+            telemetry_topic,
+            sizeof(telemetry_topic),
+            NULL) == AZ_OK)
+    {
+        mqtt_client.publish(telemetry_topic, NULL, 0, false);
+    }
+}
+
+static void initDeviceTwins()
+{
+    desiredCo2AlarmThreshold.twinProperty = "DesiredTemperature";
+    desiredCo2AlarmThreshold.twinType = LP_TYPE_FLOAT;
+    lp_openDeviceTwinSet(deviceTwinBindingSet, NELEMS(deviceTwinBindingSet));
+
+    // Get Device twin initial state
+    for (int i = 0; i < NELEMS(deviceTwinBindingSet); i++){
+        get_device_twin_document(deviceTwinBindingSet[i]->twinProperty);
+    }
 }
 
 static int connectToAzureIoTHub(const az_iot_hub_client *iot_hub_client)
@@ -289,6 +198,8 @@ static int connectToAzureIoTHub(const az_iot_hub_client *iot_hub_client)
 
     // Subscribe to the commands topic.
     mqtt_client.subscribe(AZ_IOT_HUB_CLIENT_METHODS_SUBSCRIBE_TOPIC);
+
+    mqtt_client.subscribe(AZ_IOT_HUB_CLIENT_TWIN_RESPONSE_SUBSCRIBE_TOPIC);
 
     // Subscribe to device twins desired property changes
     mqtt_client.subscribe(AZ_IOT_HUB_CLIENT_TWIN_PATCH_SUBSCRIBE_TOPIC);
@@ -369,21 +280,13 @@ void setup()
         is_ready_to_send = true;
     }
 
-    actualTemperature.twinProperty = "ActualTemperature";
-    actualTemperature.twinType = LP_TYPE_FLOAT;
+    initDeviceTwins();
 
-    desiredTemperature.twinProperty = "DesiredTemperature";
-    desiredTemperature.twinType = LP_TYPE_FLOAT;
-    desiredTemperature.handler = DeviceTwinSetTemperatureHandler;
-
-    desiredLight.twinProperty = "DesiredLight";
-    desiredLight.twinType = LP_TYPE_FLOAT;
-    desiredLight.handler = DeviceTwinSetTemperatureHandler;
-
-    lp_openDeviceTwinSet(deviceTwinBindingSet, NELEMS(deviceTwinBindingSet));
+    Wire.begin();
+    scd30.initialize();
 }
 
-static az_result send_telemetry()
+static az_result send_telemetry(float co2, float temperature, float humidity)
 {
     az_json_writer json_builder;
 
@@ -394,21 +297,25 @@ static az_result send_telemetry()
         return AZ_ERROR_NOT_SUPPORTED;
     }
 
-    float acc_x, acc_y, acc_z;
-    lis.getAcceleration(&acc_x, &acc_y, &acc_z);
+    Serial.println("before sending");
 
     AZ_RETURN_IF_FAILED(az_json_writer_init(&json_builder, AZ_SPAN_FROM_BUFFER(telemetry_payload), NULL));
     AZ_RETURN_IF_FAILED(az_json_writer_append_begin_object(&json_builder));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, imu_telemetry_name));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_begin_object(&json_builder));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("x")));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, acc_x, 3));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("y")));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, acc_y, 3));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("z")));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, acc_z, 3));
+
+    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("CO2")));
+    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, co2, 2));
+
+    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("Temperature")));
+    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, temperature, 2));
+
+    AZ_RETURN_IF_FAILED(az_json_writer_append_property_name(&json_builder, AZ_SPAN_LITERAL_FROM_STR("Humidity")));
+    AZ_RETURN_IF_FAILED(az_json_writer_append_double(&json_builder, humidity, 2));
+
     AZ_RETURN_IF_FAILED(az_json_writer_append_end_object(&json_builder));
-    AZ_RETURN_IF_FAILED(az_json_writer_append_end_object(&json_builder));
+
+    Serial.println("sending");
+
+    // AZ_RETURN_IF_FAILED(az_json_writer_append_end_object(&json_builder));
 
     az_span out_payload;
     out_payload = az_json_writer_get_bytes_used_in_destination(&json_builder);
@@ -420,16 +327,43 @@ static az_result send_telemetry()
 
 void loop()
 {
+    float result[3] = {0};
+    char buffer[20];
+
     ntp.update();
 
     if (millis() > next_telemetry_send_time_ms)
     {
-        if (is_ready_to_send)
+        // if (is_ready_to_send)
+        // {
+        //     send_telemetry();
+        // }
+
+        if (scd30.isAvailable())
         {
-            send_telemetry();
+
+            scd30.getCarbonDioxideConcentration(result);
+
+            snprintf(buffer, sizeof(buffer), "%.2f", result[0]);
+
+            lcd_log_line(buffer);
+
+            send_telemetry(result[0], result[1], result[2]);
+
+            if (desiredCo2AlarmThreshold.twinStateUpdated && result[0] > *(float *)desiredCo2AlarmThreshold.twinState)
+            {
+                analogWrite(WIO_BUZZER, 128);
+                delay(75);
+                analogWrite(WIO_BUZZER, 0);
+            }
         }
 
-        mqtt_client.loop();
         next_telemetry_send_time_ms = millis() + TELEMETRY_FREQUENCY_MILLISECS;
+    }
+
+    if (millis() > next_mqtt_loop_time_ms)
+    {
+        mqtt_client.loop();
+        next_mqtt_loop_time_ms = millis() + MQTT_LOOP_FREQUENCE_MILLISECS;
     }
 }
